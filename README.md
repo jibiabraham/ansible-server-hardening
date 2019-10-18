@@ -1,6 +1,6 @@
 # ansible-server-hardening
 
-Complementary repository to blog post at https://able.bio/jibiabraham/basic-server-hardening-using-ansible
+Complementary repository to blog post at https://able.bio/jibiabraham/basic-server-hardening-using-ansible--127r833
 
 Instructions on how to use this repository.
 
