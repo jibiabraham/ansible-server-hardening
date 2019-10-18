@@ -41,3 +41,242 @@ You will be prompted to enter a new password. Once you hit return, the hash for 
 ```
 mkpasswd --method=SHA-512 --stdin
 ```
+
+## Verbose explanations for each step in the process
+
+Things we want done on a newly spun up server instance running Ubuntu.
+TLDR version
+
+1. Update and upgrade apt packages
+2. Create a new user (deploy) for SSH access and deployments
+3. Setup logging in as deploy user using your local SSH public key
+4. Add deploy user to sudoers
+5. Setup unattended upgrades for the OS
+6. Setup firewall (UFW) for the OS
+
+### Update and upgrade apt packages
+
+This one is fairly self explanatory. We want to ensure that all the packages on the system are updated to their latest version.
+
+```yml
+- name: Update and upgrade apt packages
+  apt:
+  upgrade: yes
+  update_cache: yes
+  cache_valid_time: 86400 # Update the apt cache if its older than cache_valid_time.
+```
+
+[Ansible apt module documentation](https://docs.ansible.com/ansible/latest/modules/apt_module.html)
+
+### Create a new user for SSH access and deployments
+
+We want to create a new user with sudo access (done later on in the process). This will be the user we use to login to the instance and perform any administrative actions once the hardening process is done.
+
+```yml
+- name: Create a deploy user
+  user:
+  name: deploy
+  shell: /bin/bash
+  password: $6$kcambP/ZjEfvk0d\$0iBhHo9C0jUG2x2GaftkKEvCoffgv2Krb1MQSXlgwH3718pT7GaxZsXkmb0puMa.z3zQAzWxiYtPLVO9gYIXn0
+```
+
+Note that the password for the user must be hashed. There are several ways in which you can create a password hash. I personally prefer using the mkpasswd utility like so
+
+```console
+$ mkpasswd --method=SHA-512 --stdin
+```
+
+You will be prompted to enter a new password. Once you hit return, the hash for the password you entered will be printed on screen.
+
+### Setup logging in as deploy user using your local SSH public key
+
+Once we finish the hardening process, we want to be able to login to the instance using our local SSH public key. Like so
+
+```console
+$ ssh deploy@<instance_ip_address>
+```
+
+As a prerequisite, setup a new SSH key-pair that you want to be able to use with all of your newly created instances. You can follow the steps oultined in this GitHub help page to do so. Assuming you generated a new key-pair as remote_machines and remote_machines.pub,
+
+```yml
+- name: Set authorized key taken from file
+  authorized_key:
+  user: deploy
+  state: present
+  key: "{{ lookup('file', '/home/<your_username>/.ssh/remote_machines.pub') }}"
+```
+
+Note, replace `<your_username>` with the appropriate value.
+
+Set permissions on the authorized_keys file (on the remote machine), to allow only the file owner to read the file.
+
+```yml
+- name: Set file permissions on /home/deploy/.ssh/authorized_keys
+  file:
+  path: /home/deploy/.ssh/authorized_keys
+  owner: deploy
+  group: deploy
+  mode: 0400
+```
+
+[Ansible authorized_key module documentation](https://docs.ansible.com/ansible/latest/modules/authorized_key_module.html)
+
+[Ansible lookups documentation](https://docs.ansible.com/ansible/latest/user_guide/playbooks_lookups.html)
+
+[Ansible file module documentation](https://docs.ansible.com/ansible/latest/modules/file_module.html)
+
+[Linux file permissions documentation](https://www.linux.org/threads/file-permissions-chmod.4124/)
+
+### Add deploy user to sudoers
+
+To allow `deploy` user, created above, to have `sudo` privileges, we must add the user to the `sudoers` list
+
+```yml
+- name: Add deploy to sudoers
+  lineinfile:
+  path: /etc/sudoers
+  state: present
+  regexp: "^%deploy"
+  line: "%deploy ALL=(ALL) ALL"
+  validate: "/usr/sbin/visudo -cf %s"
+```
+
+For additional security, we remove `sudo` privileges granted by default to certain groups
+
+```yml
+- name: Disable admin group in sudoers
+  lineinfile:
+  path: /etc/sudoers
+  state: absent
+  regexp: "^%admin"
+  line: "#%admin ALL=(ALL) ALL"
+  validate: "/usr/sbin/visudo -cf %s"
+
+- name: Disable sudo group in sudoers
+  lineinfile:
+  path: /etc/sudoers
+  state: absent
+  regexp: "^%sudo"
+  line: "#%sudo ALL=(ALL) ALL"
+  validate: "/usr/sbin/visudo -cf %s"
+```
+
+And disallow login as root using password
+
+```yml
+- name: Disable root login via password
+  lineinfile:
+  path: /etc/ssh/sshd_config
+  state: present
+  regexp: "^PermitRootLogin"
+  line: "PermitRootLogin prohibit-password"
+```
+
+And allow logins only using valid SSH keys
+
+```yml
+- name: Disable PasswordAuthentication
+  lineinfile:
+  path: /etc/ssh/sshd_config
+  state: present
+  regexp: "^PasswordAuthentication"
+  line: "PasswordAuthentication no"
+```
+
+[Ansible lineinfile module documentation](https://docs.ansible.com/ansible/latest/modules/lineinfile_module.html)
+
+### Setup unattended upgrades for the OS
+
+We want all security updates to be installed automatically. We use the `Automatic Updates` package from Ubuntu to do this for us.
+
+```yml
+- name: Install unattended-upgrades package
+  apt:
+  name: unattended-upgrades
+  update_cache: yes
+
+- name: Enable periodic updates
+  copy:
+  src: 10periodic
+  dest: /etc/apt/apt.conf.d/10periodic
+  owner: root
+  group: root
+  mode: 0644
+```
+
+We’re basically copying a file with our required configuration to the remote system. The contents of the file are as such
+
+```
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Periodic::Unattended-Upgrade "1";
+```
+
+By default, only security updates are configured to be automatically applied. We can also control how frequently `apt` checks for updates. Read more about the available configuration options on the [official Ubuntu help page](https://help.ubuntu.com/lts/serverguide/automatic-updates.html) for the same.
+
+### Setup firewall (UFW) for the OS
+
+We want to be able to completely control how other remote machines can talk to our instance. On a fresh machine, the only port that needs to opened is `port 22`, that allows `SSH` access. When you install other dependencies later on (perhaps Nginx), make sure to open ports required by those applications.
+
+```yml
+- name: Enable ufw access for OpenSSH
+  ufw:
+  rule: allow
+  name: OpenSSH
+
+- name: Enable ufw
+  ufw:
+  state: enabled
+```
+
+Note: UFW is disabled by default and we must explicitly enable it.
+
+[Ansible UFW module documentation](https://docs.ansible.com/ansible/latest/modules/ufw_module.html)
+[UFW help page on Ubuntu Community Wiki](https://help.ubuntu.com/community/UFW)
+
+### Bonus points
+
+You can setup the instance to be able to pull your private Git repositories. The way to go about this is to first create a new SSH key that will have access (granted using the UI on GItHub/GitLab) to your GitHub/GitLab/other projects. And then copy said SSH key-pair to this new instance.
+
+Note, refer to this [GitHub help page](https://help.github.com/en/articles/generating-a-new-ssh-key-and-adding-it-to-the-ssh-agent) for creating SSH Keys. The post assumes that the new key-pair created are named as `deploy` and `deploy.pub`.
+
+```yml
+- name: Copy deploy ssh private key
+  copy:
+  src: deploy
+  dest: /home/deploy/.ssh/deploy
+  owner: deploy
+  group: deploy
+  mode: 0600
+- name: Copy deploy ssh public key
+  copy:
+  src: deploy.pub
+  dest: /home/deploy/.ssh/deploy.pub
+  owner: deploy
+  group: deploy
+  mode: 0644
+```
+
+You can also configure the ssh program on the instance to use this specific key, when dealing with your GitHub/GitLab projects, by creating a config file for the same.
+
+```yml
+- name: Copy ssh config file
+  copy:
+  src: ssh_config
+  dest: /home/deploy/.ssh/config
+  owner: deploy
+  group: deploy
+  mode: 0644
+```
+
+The contents of the file specify which key-pair to use and when
+
+```
+Host gitlab.com
+    HostName gitlab.com
+    PreferredAuthentications publickey
+    IdentityFile ~/.ssh/deploy
+```
+
+And that’s it. Moving to an automated workflow is hard in the beginning. Start small, and gradually move on to more complicated automated flows. I will be posting examples for automating deployments of postgres, elasticsearch, docker and for obtaining SSL certificates (Let’s Encrypt) for your machines, in future posts.
