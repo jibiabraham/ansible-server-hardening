@@ -1,0 +1,4 @@
+---
+# handlers file for harden
+- name: reset deploy password
+  command: passwd -e deploy
